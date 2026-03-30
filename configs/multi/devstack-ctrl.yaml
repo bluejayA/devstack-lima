@@ -1,0 +1,135 @@
+# Lima VM for DevStack Controller (multi-node)
+# Services: keystone, glance, nova-api/conductor/scheduler, neutron-server, cinder, placement, mysql, rabbitmq
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 2
+memory: "8GiB"
+disk: "40GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+networks:
+  - lima: shared
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      HOST_IP=$(ip -4 addr show lima0 | awk '/inet / {split($2,a,"/"); print a[1]}')
+      echo "Controller IP: $HOST_IP"
+
+      # Fix DNS
+      mkdir -p /etc/systemd/resolved.conf.d
+      cat > /etc/systemd/resolved.conf.d/dns.conf << 'DNS'
+      [Resolve]
+      DNS=8.8.8.8 8.8.4.4
+      DNS
+      systemctl restart systemd-resolved
+
+      # Basic packages
+      apt-get update
+      apt-get install -y git python3-pip python3-venv net-tools
+
+      # Create dummy interface for OVS external bridge
+      ip link add dev dummy0 type dummy || true
+      ip link set dummy0 up
+
+      # Create stack user
+      if ! id -u stack >/dev/null 2>&1; then
+        useradd -s /bin/bash -d /opt/stack -m stack
+        chmod +x /opt/stack
+      fi
+      echo "stack ALL=(ALL) NOPASSWD: ALL" | tee /etc/sudoers.d/stack
+
+      # Clone DevStack
+      if [ ! -d /opt/stack/devstack ]; then
+        sudo -u stack git clone https://opendev.org/openstack/devstack /opt/stack/devstack
+      fi
+
+      # Create local.conf
+      cat > /opt/stack/devstack/local.conf << LOCALCONF
+      [[local|localrc]]
+      MULTI_HOST=True
+      HOST_IP=$HOST_IP
+      SERVICE_HOST=$HOST_IP
+
+      ADMIN_PASSWORD=secret
+      DATABASE_PASSWORD=\$ADMIN_PASSWORD
+      RABBIT_PASSWORD=\$ADMIN_PASSWORD
+      SERVICE_PASSWORD=\$ADMIN_PASSWORD
+
+      # Controller services (no nova-compute here)
+      disable_service n-cpu
+      enable_service key n-api n-sch n-cond placement-api
+      enable_service g-api
+      enable_service c-api c-vol c-sch
+      enable_service q-svc q-agt q-dhcp q-l3 q-meta
+
+      # Neutron with OVS (explicitly disable OVN)
+      Q_AGENT=openvswitch
+      Q_ML2_PLUGIN_MECHANISM_DRIVERS=openvswitch,l2population
+      Q_ML2_TENANT_NETWORK_TYPE=vxlan
+      disable_service ovn-northd ovn-controller q-ovn-metadata-agent
+      enable_plugin neutron https://opendev.org/openstack/neutron
+
+      # Disable unneeded services
+      disable_service horizon tempest swift
+
+      # Cinder
+      VOLUME_BACKING_FILE_SIZE=10G
+
+      # External network
+      Q_USE_PROVIDERNET_FOR_PUBLIC=True
+      FLOATING_RANGE="172.24.4.0/24"
+      PUBLIC_NETWORK_GATEWAY="172.24.4.1"
+      Q_FLOATING_ALLOCATION_POOL=start=172.24.4.100,end=172.24.4.200
+      PUBLIC_INTERFACE=dummy0
+      PUBLIC_NETWORK_NAME=public
+      PUBLIC_SUBNET_NAME=public-subnet
+
+      # Internal network
+      NETWORK_GATEWAY=10.0.0.1
+      FIXED_RANGE="10.0.0.0/24"
+      IPV4_ADDRS_SAFE_TO_USE="10.0.0.0/8"
+
+      # Allow same-host migration (fallback if compute count < 2)
+      [[post-config|\$NOVA_CONF]]
+      [DEFAULT]
+      allow_resize_to_same_host = True
+
+      [libvirt]
+      virt_type=qemu
+
+      # Logging
+      LOGFILE=\$DEST/logs/stack.sh.log
+      LOGDAYS=2
+      LOCALCONF
+      chown stack:stack /opt/stack/devstack/local.conf
+
+      # Save controller IP for compute nodes
+      echo "$HOST_IP" > /opt/stack/controller_ip
+
+portForwards:
+  - guestPort: 5000
+    hostPort: 5000
+    proto: tcp
+  - guestPort: 8774
+    hostPort: 8774
+    proto: tcp
+  - guestPort: 9292
+    hostPort: 9292
+    proto: tcp
+  - guestPort: 8776
+    hostPort: 8776
+    proto: tcp
+  - guestPort: 9696
+    hostPort: 9696
+    proto: tcp

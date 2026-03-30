@@ -1,0 +1,109 @@
+# Lima VM for DevStack (OpenStack All-in-One)
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "12GiB"
+disk: "60GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Fix DNS
+      mkdir -p /etc/systemd/resolved.conf.d
+      cat > /etc/systemd/resolved.conf.d/dns.conf << 'DNS'
+      [Resolve]
+      DNS=8.8.8.8 8.8.4.4
+      DNS
+      systemctl restart systemd-resolved
+
+      # Basic packages
+      apt-get update
+      apt-get install -y git python3-pip python3-venv net-tools
+
+      # Create dummy interface for OVS external bridge (avoid touching eth0)
+      ip link add dev dummy0 type dummy || true
+      ip link set dummy0 up
+
+      # Create stack user
+      if ! id -u stack >/dev/null 2>&1; then
+        useradd -s /bin/bash -d /opt/stack -m stack
+        chmod +x /opt/stack
+      fi
+      echo "stack ALL=(ALL) NOPASSWD: ALL" | tee /etc/sudoers.d/stack
+
+      # Clone DevStack
+      if [ ! -d /opt/stack/devstack ]; then
+        sudo -u stack git clone https://opendev.org/openstack/devstack /opt/stack/devstack
+      fi
+
+      # Create local.conf
+      cat > /opt/stack/devstack/local.conf << 'LOCALCONF'
+      [[local|localrc]]
+      ADMIN_PASSWORD=secret
+      DATABASE_PASSWORD=$ADMIN_PASSWORD
+      RABBIT_PASSWORD=$ADMIN_PASSWORD
+      SERVICE_PASSWORD=$ADMIN_PASSWORD
+
+      # Core services
+      enable_service key n-api n-sch n-cpu n-cond
+      enable_service g-api
+      enable_service c-api c-vol c-sch
+      enable_service q-svc q-agt q-dhcp q-l3 q-meta
+
+      # Neutron with OVS (legacy agent mode, not OVN)
+      Q_AGENT=openvswitch
+      disable_service ovn-northd ovn-controller
+
+      # Disable unneeded services
+      disable_service horizon tempest swift
+
+      # Cinder
+      VOLUME_BACKING_FILE_SIZE=10G
+
+      # External network — use dummy0 to avoid breaking SSH on eth0
+      Q_USE_PROVIDERNET_FOR_PUBLIC=True
+      FLOATING_RANGE="172.24.4.0/24"
+      PUBLIC_NETWORK_GATEWAY="172.24.4.1"
+      Q_FLOATING_ALLOCATION_POOL=start=172.24.4.100,end=172.24.4.200
+      PUBLIC_INTERFACE=dummy0
+      PUBLIC_NETWORK_NAME=public
+      PUBLIC_SUBNET_NAME=public-subnet
+
+      # Internal network
+      NETWORK_GATEWAY=10.0.0.1
+      FIXED_RANGE="10.0.0.0/24"
+      IPV4_ADDRS_SAFE_TO_USE="10.0.0.0/8"
+
+      # Logging
+      LOGFILE=$DEST/logs/stack.sh.log
+      LOGDAYS=2
+      LOCALCONF
+      chown stack:stack /opt/stack/devstack/local.conf
+
+portForwards:
+  - guestPort: 5000
+    hostPort: 5000
+    proto: tcp
+  - guestPort: 8774
+    hostPort: 8774
+    proto: tcp
+  - guestPort: 9292
+    hostPort: 9292
+    proto: tcp
+  - guestPort: 8776
+    hostPort: 8776
+    proto: tcp
+  - guestPort: 9696
+    hostPort: 9696
+    proto: tcp

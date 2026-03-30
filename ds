@@ -1,0 +1,420 @@
+#!/bin/bash
+# DevStack Lima VM launcher
+# Usage:
+#   ds up single|multi      — Start VMs
+#   ds down single|multi    — Stop VMs
+#   ds status               — Show all DevStack VMs
+#   ds ssh <vm-name>        — SSH into a VM
+#   ds stack <vm-name>      — Run stack.sh inside a VM
+#   ds configure-compute <vm-name> <controller_ip>  — Set controller IP on compute node
+#   ds ips                  — Show lima0 IPs of running multi-node VMs
+#   ds validate [single|multi] — Validate DevStack installation (infra, services, instance)
+#   ds post-setup multi       — Fix ARM/libvirt/cell issues after stack.sh completes
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SINGLE_DIR="$SCRIPT_DIR/configs/single"
+MULTI_DIR="$SCRIPT_DIR/configs/multi"
+
+SINGLE_VMS=(devstack)
+MULTI_VMS=(devstack-ctrl devstack-cp1 devstack-cp2)
+
+usage() {
+    cat <<'HELP'
+DevStack Lima VM Launcher
+
+Commands:
+  ds up single          Start all-in-one DevStack VM
+  ds up multi           Start controller + 2 compute VMs
+  ds down single        Stop all-in-one VM
+  ds down multi         Stop all multi-node VMs
+  ds status             List all DevStack VMs
+  ds ssh <vm>           SSH into a VM
+  ds stack <vm>         Run stack.sh inside a VM (as stack user)
+  ds configure-compute <vm> <ctrl_ip>
+                        Replace controller IP placeholder in compute local.conf
+  ds ips                Show lima0 IPs of running multi-node VMs
+  ds validate [single|multi]
+                        Validate DevStack: infra, services, instance creation
+  ds post-setup multi   Fix ARM CPU mode, libvirt TCP, and cell mapping
+                        (run once after all stack.sh completions)
+HELP
+    exit 1
+}
+
+cmd_up() {
+    local mode="${1:-}"
+    case "$mode" in
+        single)
+            echo "Starting single all-in-one DevStack..."
+            limactl start --name=devstack "$SINGLE_DIR/devstack.yaml" --tty=false 2>/dev/null \
+                || limactl start devstack
+            echo "Done. Run 'ds stack devstack' to install OpenStack."
+            ;;
+        multi)
+            echo "Starting multi-node DevStack (ctrl + cp1 + cp2)..."
+            for vm in "${MULTI_VMS[@]}"; do
+                echo "  Starting $vm..."
+                limactl start --name="$vm" "$MULTI_DIR/$vm.yaml" --tty=false 2>/dev/null \
+                    || limactl start "$vm"
+            done
+            echo ""
+            echo "VMs started. Next steps:"
+            echo "  1. ds ips                              — get controller IP"
+            echo "  2. ds configure-compute devstack-cp1 <ctrl_ip>"
+            echo "     ds configure-compute devstack-cp2 <ctrl_ip>"
+            echo "  3. ds stack devstack-ctrl              — install controller first"
+            echo "  4. ds stack devstack-cp1               — then compute nodes"
+            echo "     ds stack devstack-cp2"
+            ;;
+        *)
+            echo "Error: specify 'single' or 'multi'"
+            usage
+            ;;
+    esac
+}
+
+cmd_down() {
+    local mode="${1:-}"
+    case "$mode" in
+        single)
+            echo "Stopping single DevStack..."
+            limactl stop devstack 2>/dev/null || true
+            ;;
+        multi)
+            echo "Stopping multi-node DevStack..."
+            for vm in "${MULTI_VMS[@]}"; do
+                limactl stop "$vm" 2>/dev/null || true
+            done
+            ;;
+        *)
+            echo "Error: specify 'single' or 'multi'"
+            usage
+            ;;
+    esac
+    echo "Done."
+}
+
+cmd_status() {
+    echo "DevStack VMs:"
+    limactl list | head -1
+    limactl list | grep -E "devstack" || echo "  (none running)"
+}
+
+cmd_ssh() {
+    local vm="${1:?Usage: ds ssh <vm-name>}"
+    limactl shell "$vm"
+}
+
+cmd_stack() {
+    local vm="${1:?Usage: ds stack <vm-name>}"
+    echo "Running stack.sh on $vm (this will take 15-30 minutes)..."
+    limactl shell "$vm" -- sudo -iu stack bash -c 'cd /opt/stack/devstack && ./stack.sh'
+}
+
+cmd_configure_compute() {
+    local vm="${1:?Usage: ds configure-compute <vm-name> <controller_ip>}"
+    local ctrl_ip="${2:?Usage: ds configure-compute <vm-name> <controller_ip>}"
+    echo "Setting controller IP to $ctrl_ip on $vm..."
+    limactl shell "$vm" -- sudo sed -i "s/CONTROLLER_IP_PLACEHOLDER/$ctrl_ip/g" /opt/stack/devstack/local.conf
+    echo "Done. Verify with: ds ssh $vm -- cat /opt/stack/devstack/local.conf"
+}
+
+cmd_ips() {
+    echo "Multi-node VM IPs (lima0):"
+    for vm in "${MULTI_VMS[@]}"; do
+        local ip
+        ip=$(limactl shell "$vm" -- ip -4 addr show lima0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}' || echo "not running")
+        [ -z "$ip" ] && ip="not running"
+        printf "  %-20s %s\n" "$vm" "$ip"
+    done
+}
+
+cmd_post_setup() {
+    local mode="${1:-}"
+    if [ "$mode" != "multi" ]; then
+        echo "Usage: ds post-setup multi"
+        echo "  (single mode does not require post-setup)"
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Post-Setup: ARM CPU mode fix ==="
+    echo "  DevStack defaults to cpu_mode=host-passthrough which is unsupported"
+    echo "  on ARM QEMU. Changing to cpu_mode=custom with cortex-a72."
+    for vm in "${MULTI_VMS[@]}"; do
+        # Only apply to compute nodes (those running nova-compute)
+        if [[ "$vm" == devstack-cp* ]]; then
+            echo "  Fixing $vm..."
+            limactl shell "$vm" -- sudo bash -c '
+                for conf in /etc/nova/nova-cpu.conf /etc/nova/nova.conf; do
+                    if [ -f "$conf" ] && grep -q "cpu_mode = host-passthrough" "$conf"; then
+                        sed -i "s/cpu_mode = host-passthrough/cpu_mode = custom\ncpu_model = cortex-a72/" "$conf"
+                        echo "    Fixed $conf"
+                    fi
+                done
+            '
+        fi
+    done
+
+    echo ""
+    echo "=== Post-Setup: libvirt TCP socket (for live migration) ==="
+    for vm in "${MULTI_VMS[@]}"; do
+        if [[ "$vm" == devstack-cp* ]]; then
+            echo "  Enabling libvirtd-tcp.socket on $vm..."
+            limactl shell "$vm" -- sudo bash -c '
+                # Set auth_tcp=none for passwordless migration
+                if ! grep -q "^auth_tcp" /etc/libvirt/libvirtd.conf 2>/dev/null; then
+                    echo "auth_tcp = \"none\"" >> /etc/libvirt/libvirtd.conf
+                fi
+                # Stop libvirtd, enable TCP socket, restart
+                systemctl stop libvirtd 2>/dev/null || true
+                systemctl enable libvirtd-tcp.socket 2>/dev/null || true
+                systemctl start libvirtd-tcp.socket 2>/dev/null || true
+                systemctl start libvirtd 2>/dev/null || true
+            '
+            # Verify TCP port
+            if limactl shell "$vm" -- sudo ss -tlnp 2>/dev/null | grep -q 16509; then
+                echo "    TCP 16509 listening"
+            else
+                echo "    WARNING: TCP 16509 not listening"
+            fi
+        fi
+    done
+
+    echo ""
+    echo "=== Post-Setup: Restart nova-compute ==="
+    for vm in "${MULTI_VMS[@]}"; do
+        if [[ "$vm" == devstack-cp* ]]; then
+            echo "  Restarting nova-compute on $vm..."
+            limactl shell "$vm" -- sudo systemctl restart devstack@n-cpu
+        fi
+    done
+
+    echo ""
+    echo "=== Post-Setup: Cell mapping (discover compute hosts) ==="
+    echo "  Waiting 10s for nova-compute to register..."
+    sleep 10
+    limactl shell devstack-ctrl -- sudo -iu stack bash -c \
+        'source /opt/stack/devstack/openrc admin admin && nova-manage cell_v2 discover_hosts --verbose' 2>&1 \
+        | grep -E "Creating|Found|Skipping"
+
+    echo ""
+    echo "=== Post-Setup complete ==="
+    echo "Run 'ds validate multi' to verify."
+}
+
+PASS="\033[32mPASS\033[0m"
+FAIL="\033[31mFAIL\033[0m"
+SKIP="\033[33mSKIP\033[0m"
+
+check() {
+    local label="$1"
+    shift
+    if output=$("$@" 2>&1); then
+        printf "  [${PASS}] %s\n" "$label"
+        return 0
+    else
+        printf "  [${FAIL}] %s\n" "$label"
+        [ -n "$output" ] && printf "         %s\n" "$output"
+        return 1
+    fi
+}
+
+check_output() {
+    local label="$1"
+    shift
+    if output=$("$@" 2>&1) && [ -n "$output" ]; then
+        printf "  [${PASS}] %s\n" "$label"
+        echo "$output" | sed 's/^/         /'
+        return 0
+    else
+        printf "  [${FAIL}] %s\n" "$label"
+        [ -n "$output" ] && printf "         %s\n" "$output"
+        return 1
+    fi
+}
+
+# Run a command on controller as stack user with openrc loaded
+ctrl_openstack() {
+    limactl shell devstack-ctrl -- sudo -iu stack bash -c "source /opt/stack/devstack/openrc admin admin && $*"
+}
+
+single_openstack() {
+    limactl shell devstack -- sudo -iu stack bash -c "source /opt/stack/devstack/openrc admin admin && $*"
+}
+
+cmd_validate() {
+    local mode="${1:-multi}"
+    local failed=0
+
+    case "$mode" in
+        single) validate_single || failed=1 ;;
+        multi)  validate_multi || failed=1 ;;
+        *)
+            echo "Error: specify 'single' or 'multi'"
+            usage
+            ;;
+    esac
+
+    echo ""
+    if [ "$failed" -eq 0 ]; then
+        printf "\033[32m=== All checks passed ===\033[0m\n"
+    else
+        printf "\033[31m=== Some checks failed ===\033[0m\n"
+        return 1
+    fi
+}
+
+validate_single() {
+    local failed=0
+
+    echo ""
+    echo "=== Stage 1: Infrastructure ==="
+    check "VM devstack is running" limactl shell devstack -- true || failed=1
+
+    echo ""
+    echo "=== Stage 2: OpenStack Services ==="
+    check_output "Compute services" single_openstack "openstack compute service list -f value -c Binary -c State" || failed=1
+    check_output "Network agents" single_openstack "openstack network agent list -f value -c 'Agent Type' -c Alive" || failed=1
+    check_output "Hypervisor list" single_openstack "openstack hypervisor list -f value -c 'Hypervisor Hostname' -c State" || failed=1
+
+    echo ""
+    echo "=== Stage 3: Instance Lifecycle ==="
+    validate_instance_lifecycle single || failed=1
+
+    return $failed
+}
+
+validate_multi() {
+    local failed=0
+    local ctrl_ip cp1_ip cp2_ip
+
+    ctrl_ip=$(limactl shell devstack-ctrl -- ip -4 addr show lima0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}')
+    cp1_ip=$(limactl shell devstack-cp1 -- ip -4 addr show lima0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}')
+    cp2_ip=$(limactl shell devstack-cp2 -- ip -4 addr show lima0 2>/dev/null | awk '/inet / {split($2,a,"/"); print a[1]}')
+
+    echo ""
+    echo "=== Stage 1: Infrastructure ==="
+    echo "  IPs: ctrl=$ctrl_ip  cp1=$cp1_ip  cp2=$cp2_ip"
+
+    check "VM devstack-ctrl is running" limactl shell devstack-ctrl -- true || failed=1
+    check "VM devstack-cp1 is running" limactl shell devstack-cp1 -- true || failed=1
+    check "VM devstack-cp2 is running" limactl shell devstack-cp2 -- true || failed=1
+
+    check "ctrl → cp1 ping" limactl shell devstack-ctrl -- ping -c 1 -W 2 "$cp1_ip" || failed=1
+    check "ctrl → cp2 ping" limactl shell devstack-ctrl -- ping -c 1 -W 2 "$cp2_ip" || failed=1
+    check "cp1 → cp2 ping" limactl shell devstack-cp1 -- ping -c 1 -W 2 "$cp2_ip" || failed=1
+
+    echo ""
+    echo "  Checking libvirt TCP connectivity (for live migration)..."
+    check "cp1 → cp2 libvirt" limactl shell devstack-cp1 -- virsh -c "qemu+tcp://$cp2_ip/system" list || {
+        printf "  [${SKIP}] libvirt TCP — may need post-install configuration\n"
+    }
+    check "cp2 → cp1 libvirt" limactl shell devstack-cp2 -- virsh -c "qemu+tcp://$cp1_ip/system" list || {
+        printf "  [${SKIP}] libvirt TCP — may need post-install configuration\n"
+    }
+
+    echo ""
+    echo "=== Stage 2: OpenStack Services ==="
+    check_output "Compute services" ctrl_openstack "openstack compute service list -f value -c Binary -c Host -c State" || failed=1
+    check_output "Network agents" ctrl_openstack "openstack network agent list -f value -c 'Agent Type' -c Host -c Alive" || failed=1
+
+    local hypervisor_count
+    hypervisor_count=$(ctrl_openstack "openstack hypervisor list -f value -c 'Hypervisor Hostname' -c State" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$hypervisor_count" -ge 2 ]; then
+        printf "  [${PASS}] Hypervisors: $hypervisor_count registered (need >= 2)\n"
+        ctrl_openstack "openstack hypervisor list -f value -c 'Hypervisor Hostname' -c State" 2>/dev/null | sed 's/^/         /'
+    else
+        printf "  [${FAIL}] Hypervisors: $hypervisor_count registered (need >= 2)\n"
+        failed=1
+    fi
+
+    echo ""
+    echo "=== Stage 3: Instance Lifecycle ==="
+    validate_instance_lifecycle multi || failed=1
+
+    return $failed
+}
+
+validate_instance_lifecycle() {
+    local mode="$1"
+    local os_cmd
+    local failed=0
+
+    if [ "$mode" = "single" ]; then
+        os_cmd="single_openstack"
+    else
+        os_cmd="ctrl_openstack"
+    fi
+
+    # Find cirros image
+    local image
+    image=$($os_cmd "openstack image list -f value -c Name" 2>/dev/null | grep -i cirros | head -1)
+    if [ -z "$image" ]; then
+        printf "  [${FAIL}] No cirros image found\n"
+        return 1
+    fi
+    printf "  [${PASS}] Image found: $image\n"
+
+    # Find network
+    local network
+    network=$($os_cmd "openstack network list -f value -c Name" 2>/dev/null | grep -i private | head -1)
+    if [ -z "$network" ]; then
+        network=$($os_cmd "openstack network list -f value -c Name" 2>/dev/null | head -1)
+    fi
+    if [ -z "$network" ]; then
+        printf "  [${FAIL}] No network found\n"
+        return 1
+    fi
+    printf "  [${PASS}] Network found: $network\n"
+
+    # Clean up previous test instance
+    $os_cmd "openstack server delete ds-validate-test --wait 2>/dev/null" || true
+
+    # Create test instance
+    printf "  [ .. ] Creating test instance 'ds-validate-test'..."
+    if $os_cmd "openstack server create --flavor m1.tiny --image '$image' --network '$network' ds-validate-test --wait" >/dev/null 2>&1; then
+        printf "\r  [${PASS}] Instance created: ds-validate-test\n"
+    else
+        printf "\r  [${FAIL}] Instance creation failed\n"
+        return 1
+    fi
+
+    # Check status
+    local status host
+    status=$($os_cmd "openstack server show ds-validate-test -f value -c status" 2>/dev/null)
+    host=$($os_cmd "openstack server show ds-validate-test -f value -c OS-EXT-SRV-ATTR:host" 2>/dev/null)
+
+    if [ "$status" = "ACTIVE" ]; then
+        printf "  [${PASS}] Instance status: ACTIVE (host: $host)\n"
+    else
+        printf "  [${FAIL}] Instance status: $status (expected ACTIVE)\n"
+        failed=1
+    fi
+
+    # Cleanup
+    printf "  [ .. ] Cleaning up test instance..."
+    $os_cmd "openstack server delete ds-validate-test --wait" >/dev/null 2>&1 || true
+    printf "\r  [${PASS}] Test instance cleaned up\n"
+
+    return $failed
+}
+
+# Main dispatch
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    up)     cmd_up "$@" ;;
+    down)   cmd_down "$@" ;;
+    status) cmd_status ;;
+    ssh)    cmd_ssh "$@" ;;
+    stack)  cmd_stack "$@" ;;
+    configure-compute) cmd_configure_compute "$@" ;;
+    ips)        cmd_ips ;;
+    validate)   cmd_validate "$@" ;;
+    post-setup) cmd_post_setup "$@" ;;
+    *)          usage ;;
+esac

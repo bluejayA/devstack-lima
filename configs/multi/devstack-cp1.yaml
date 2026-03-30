@@ -1,0 +1,101 @@
+# Lima VM for DevStack Compute Node 1 (multi-node)
+# Services: nova-compute, neutron-ovs-agent, libvirtd
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 2
+memory: "4GiB"
+disk: "30GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+networks:
+  - lima: shared
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      HOST_IP=$(ip -4 addr show lima0 | awk '/inet / {split($2,a,"/"); print a[1]}')
+      echo "Compute-1 IP: $HOST_IP"
+
+      # Fix DNS
+      mkdir -p /etc/systemd/resolved.conf.d
+      cat > /etc/systemd/resolved.conf.d/dns.conf << 'DNS'
+      [Resolve]
+      DNS=8.8.8.8 8.8.4.4
+      DNS
+      systemctl restart systemd-resolved
+
+      # Basic packages
+      apt-get update
+      apt-get install -y git python3-pip python3-venv net-tools
+
+      # Create stack user
+      if ! id -u stack >/dev/null 2>&1; then
+        useradd -s /bin/bash -d /opt/stack -m stack
+        chmod +x /opt/stack
+      fi
+      echo "stack ALL=(ALL) NOPASSWD: ALL" | tee /etc/sudoers.d/stack
+
+      # Clone DevStack
+      if [ ! -d /opt/stack/devstack ]; then
+        sudo -u stack git clone https://opendev.org/openstack/devstack /opt/stack/devstack
+      fi
+
+      # Placeholder local.conf — controller IP must be set before stack.sh
+      # Run: ds configure-compute devstack-cp1 <controller_ip>
+      cat > /opt/stack/devstack/local.conf << LOCALCONF
+      [[local|localrc]]
+      MULTI_HOST=True
+      HOST_IP=$HOST_IP
+      SERVICE_HOST=CONTROLLER_IP_PLACEHOLDER
+      MYSQL_HOST=CONTROLLER_IP_PLACEHOLDER
+      RABBIT_HOST=CONTROLLER_IP_PLACEHOLDER
+      GLANCE_HOSTPORT=CONTROLLER_IP_PLACEHOLDER:9292
+      Q_HOST=CONTROLLER_IP_PLACEHOLDER
+
+      ADMIN_PASSWORD=secret
+      DATABASE_PASSWORD=\$ADMIN_PASSWORD
+      RABBIT_PASSWORD=\$ADMIN_PASSWORD
+      SERVICE_PASSWORD=\$ADMIN_PASSWORD
+
+      # Compute-only services
+      ENABLED_SERVICES=n-cpu,q-agt,placement-client
+      DATABASE_TYPE=mysql
+
+      # Neutron with OVS (must match controller)
+      Q_AGENT=openvswitch
+      Q_ML2_PLUGIN_MECHANISM_DRIVERS=openvswitch,l2population
+      Q_ML2_TENANT_NETWORK_TYPE=vxlan
+
+      # Libvirt for live migration
+      [[post-config|\$NOVA_CONF]]
+      [libvirt]
+      virt_type=qemu
+      vncserver_listen=0.0.0.0
+      live_migration_uri=qemu+tcp://%s/system
+
+      # Logging
+      LOGFILE=\$DEST/logs/stack.sh.log
+      LOGDAYS=2
+      LOCALCONF
+      chown stack:stack /opt/stack/devstack/local.conf
+
+      # Configure libvirtd for TCP (live migration)
+      # Ubuntu 24.04 libvirt 10.0 uses socket activation instead of --listen
+      mkdir -p /etc/libvirt
+      cat > /etc/libvirt/libvirtd.conf << 'LIBVIRT'
+      auth_tcp = "none"
+      LIBVIRT
+
+      # Enable libvirt TCP socket (port 16509)
+      systemctl enable libvirtd-tcp.socket 2>/dev/null || true
+      systemctl start libvirtd-tcp.socket 2>/dev/null || true
