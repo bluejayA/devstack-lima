@@ -57,6 +57,20 @@ cd devstack-lima
                    └─────────────┘       └─────────────┘
 ```
 
+## Claude Code Skill
+
+Claude Code를 사용한다면, skill을 설치하면 `/devstack-setup`으로 설치를 맡길 수 있습니다:
+
+```bash
+./install-skill.sh
+```
+
+이후 아무 프로젝트에서나:
+```
+> /devstack-setup
+> devstack 멀티노드 설치해줘
+```
+
 ## Detailed Guide
 
 See [INSTALL.md](INSTALL.md) for manual setup, troubleshooting, and nexttui integration.
